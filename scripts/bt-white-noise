@@ -1,0 +1,159 @@
+#!/bin/zsh
+
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+SOCKET="$HOME/.bt-white-noise.sock"
+PIDFILE="$HOME/.bt-white-noise.pid"
+TYPEFILE="$HOME/.bt-white-noise-type"
+NOISE_DIR="$HOME/Library/Application Support/BT White Noise"
+CONFIG="$HOME/.config/bt-white-noise/device-uid"
+UID_VALUE="$(cat "$CONFIG" 2>/dev/null || true)"
+DEVICE="coreaudio/$UID_VALUE"
+
+noise_type() {
+    local value="white"
+
+    if [[ -f "$TYPEFILE" ]]; then
+        value=$(tr -d '[:space:]' < "$TYPEFILE")
+    fi
+
+    case "$value" in
+        white|pink|brown) echo "$value" ;;
+        *) echo "white" ;;
+    esac
+}
+
+TYPE=$(noise_type)
+AUDIO="$NOISE_DIR/$TYPE.wav"
+
+device_available() {
+    [[ -n "$UID_VALUE" ]] || return 1
+    mpv --no-config --audio-device=help 2>&1 |
+        grep -Fq "'$DEVICE'"
+}
+
+is_running() {
+    [[ -f "$PIDFILE" ]] || return 1
+    local pid
+    pid=$(cat "$PIDFILE")
+    kill -0 "$pid" 2>/dev/null && [[ -S "$SOCKET" ]]
+}
+
+send_cmd() {
+    printf '%s\n' "$1" |
+        socat -T 0.5 - UNIX-CONNECT:"$SOCKET" 2>/dev/null
+}
+
+ensure_running() {
+    if is_running; then
+        return 0
+    fi
+
+    device_available || return 1
+    [[ -f "$AUDIO" ]] || return 1
+
+    rm -f "$SOCKET" "$PIDFILE"
+
+    nohup mpv \
+        --no-config \
+        --no-video \
+        --no-terminal \
+        --ao=coreaudio \
+        --audio-device="$DEVICE" \
+        --audio-fallback-to-null=no \
+        --loop-file=inf \
+        --volume=100 \
+        --volume-max=100 \
+        --mute=yes \
+        --input-ipc-server="$SOCKET" \
+        "$AUDIO" \
+        >/tmp/bt-white-noise.log 2>&1 &
+
+    echo $! > "$PIDFILE"
+
+    for _ in {1..40}; do
+        [[ -S "$SOCKET" ]] && return 0
+        sleep 0.05
+    done
+
+    return 1
+}
+
+load_selected_audio() {
+    send_cmd "{\"command\":[\"loadfile\",\"$AUDIO\",\"replace\"]}" \
+        >/dev/null
+}
+
+case "$1" in
+    start)
+        device_available || exit 2
+        ensure_running || exit 1
+        send_cmd '{"command":["set_property","mute",true]}' >/dev/null
+        load_selected_audio
+        send_cmd "{\"command\":[\"set_property\",\"audio-device\",\"$DEVICE\"]}" >/dev/null
+        send_cmd '{"command":["ao-reload"]}' >/dev/null
+        sleep 0.15
+
+        reply=$(send_cmd '{"command":["get_property","audio-device"]}')
+        [[ "$reply" == *"\"data\":\"$DEVICE\""* ]] || exit 3
+
+        send_cmd '{"command":["set_property","volume",100]}' >/dev/null
+        send_cmd '{"command":["set_property","mute",false]}' >/dev/null
+        ;;
+
+    stop)
+        if is_running; then
+            send_cmd '{"command":["set_property","mute",true]}' >/dev/null
+        fi
+        ;;
+
+    status)
+        if ! is_running; then
+            echo "off"
+            exit 0
+        fi
+
+        reply=$(send_cmd '{"command":["get_property","mute"]}')
+
+        if [[ "$reply" == *'"data":false'* ]]; then
+            echo "on"
+        else
+            echo "off"
+        fi
+        ;;
+
+    type)
+        noise_type
+        ;;
+
+    select)
+        case "$2" in
+            white|pink|brown) ;;
+            *) exit 4 ;;
+        esac
+
+        mkdir -p "$NOISE_DIR"
+        AUDIO="$NOISE_DIR/$2.wav"
+        [[ -f "$AUDIO" ]] || exit 5
+        printf '%s\n' "$2" > "$TYPEFILE"
+
+        if is_running; then
+            load_selected_audio
+        fi
+        ;;
+
+    reset)
+        "$0" shutdown
+        sleep 0.2
+        "$0" start
+        ;;
+
+    shutdown)
+        if is_running; then
+            send_cmd '{"command":["quit"]}' >/dev/null
+            sleep 0.15
+        fi
+
+        rm -f "$SOCKET" "$PIDFILE"
+        ;;
+esac
